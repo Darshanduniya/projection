@@ -1,36 +1,50 @@
 import sys
 import struct
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit, col
 
-spark = SparkSession.builder.appName("HiveToBinConversion").enableHiveSupport().getOrCreate()
+# 1. Create Spark session
+spark = SparkSession.builder \
+    .appName("HiveToBinConversion_SingleFile") \
+    .enableHiveSupport() \
+    .getOrCreate()
 
-schema = sys.argv[3]
-stg_path = sys.argv[4]
-start_week = int(sys.argv[1])
-end_week = int(sys.argv[2])
+# 2. Arguments
+start_week = int(sys.argv[1])  # e.g. 2896
+end_week   = int(sys.argv[2])  # e.g. 2897
+schema     = sys.argv[3]       # e.g. prd_us_npd_pos_apl_opm
+stg_path   = sys.argv[4]       # e.g. /npd/staging/prd/output/
 
 for week in range(start_week, end_week):
-    # Read all needed columns at once using DataFrame API
+    # 3. Query Hive in parallel
     df = spark.sql(f"""
-      SELECT DISTINCT
-          b.vg_dim,
-          b.venue_dim_key,
-          CAST(1 AS FLOAT) AS store_weight,
-          1 AS dummy_val
-      FROM {schema}.hlx_wkly_fact_venue_time_apl_opm a
-      JOIN {schema}.vg_venue_mapping b
-         ON a.venue_dim_key = b.venue_dim_key
-      WHERE a.tm_dim_key = '{week}'
+        SELECT DISTINCT
+            b.vg_dim,
+            b.venue_dim_key,
+            CAST(1 AS FLOAT) AS store_weight,
+            1 AS dummy_val
+        FROM {schema}.hlx_wkly_fact_venue_time_apl_opm a
+        JOIN {schema}.vg_venue_mapping b
+           ON a.venue_dim_key = b.venue_dim_key
+        WHERE a.tm_dim_key = '{week}'
     """)
     
-    # Convert DataFrame to RDD of bytes
+    # 4. Binary conversion function
     def row_to_bin(row):
-        # Pack fields in order: vg_dim (int), venue_dim_key (int), store_weight (float), dummy_val (int)
         return struct.pack('iifI', row.vg_dim, row.venue_dim_key, row.store_weight, row.dummy_val)
     
+    # 5. Do binary conversion in parallel - returns an RDD of bytes
     bin_rdd = df.rdd.map(row_to_bin)
-    # Save as binary file (note: .saveAsTextFile does not create pure binary, use Hadoop OutputFormat for raw binary)
-    bin_rdd.saveAsPickleFile(f"{stg_path}/Proj_{week}_binrdd")  # Fastest for Spark; can be loaded in parallel, or use custom OutputFormat if native binary is required
+
+    # 6. Collect all binary rows into driver memory
+    # (We keep rows as bytes, so memory use is smaller than with raw Row objects)
+    binary_rows = bin_rdd.collect()
+
+    # 7. Write single .bin file
+    output_file = f"{stg_path}/Proj_{week}.bin"
+    with open(output_file, "wb") as f:
+        for b in binary_rows:
+            f.write(b)
+
+    print(f"✅ Week {week} -> Written {len(binary_rows)} rows to {output_file}")
 
 spark.stop()
