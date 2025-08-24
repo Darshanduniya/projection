@@ -1,0 +1,74 @@
+from multiprocessing import Pool
+from rapidfuzz import process
+import numpy as np
+import pymonetdb
+import pandas as pd
+
+# ---- DB Connection ----
+conn = pymonetdb.connect(
+    username='USR_TIKTOK_SHOPE_MRT_P',
+    password='Passw0rd',
+    hostname='lnx2304.ch3.dev.i.com',
+    port='50239',
+    database='DB_MRT_TIKTOK_SHOPE_PA',
+    autocommit=True
+)
+cursor = conn.cursor()
+
+# ---- Query Table1 ----
+cursor.execute("""
+select distinct category_1 || ' ' || category_2 || ' ' || category_3 as catg,
+       category_1, category_2, category_3
+from "PROD_TIKTOK_SHOP_COMBINED"
+""")
+table1 = pd.DataFrame(cursor.fetchall(), columns=["catg", "category_1", "category_2", "category_3"])
+
+# ---- Query Table2 ----
+cursor.execute("""
+select distinct trim(lower(attr_value)) as catg,
+       '2323' as category_1, '3345' as category_2, '2342' as category_3
+from "IT_DS3_IRI_28740"
+where lower(attr_name) like '%category%'
+""")
+table2 = pd.DataFrame(cursor.fetchall(), columns=["catg", "category_1", "category_2", "category_3"])
+
+# ---- Matching Function ----
+def match_chunk(chunk, choices):
+    results = []
+    for row in chunk.itertuples(index=False):
+        best_match = process.extractOne(row.catg, choices, score_cutoff=80)
+        if best_match:
+            results.append((
+                row.catg,
+                row.category_1,
+                row.category_2,
+                row.category_3,
+                best_match[0],  # matched category from table2
+                best_match[1]   # fuzzy score
+            ))
+        else:
+            results.append((
+                row.catg,
+                row.category_1,
+                row.category_2,
+                row.category_3,
+                None,
+                0
+            ))
+    return results
+
+# ---- Split data and process in parallel ----
+chunks = np.array_split(table1, 100)  # Split by rows of full table1, not just 'catg'
+with Pool(10) as pool:
+    results = pool.starmap(match_chunk, [(chunk, table2['catg']) for chunk in chunks])
+
+# ---- Combine all results ----
+matches = [item for sublist in results for item in sublist]
+
+# ---- Create final DataFrame ----
+test = pd.DataFrame(matches, columns=[
+    'original_catg', 'category_1', 'category_2', 'category_3',
+    'matched_catg', 'match_score'
+])
+
+print(test.to_string())
